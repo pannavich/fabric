@@ -2,6 +2,10 @@ accelerate==0.18.0
 diffusers==0.17.1
 torch==2.0.1
 transformers==4.30.2
+gradio==3.36.1
+xformers==0.0.20 
+triton==2.0.0
+controlnet-aux==0.0.6
 hydra-core
 matplotlib
 pandas

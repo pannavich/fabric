@@ -8,12 +8,35 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 from diffusers import (
-    StableDiffusionPipeline,
+    StableDiffusionControlNetPipeline,
     EulerAncestralDiscreteScheduler,
+    ControlNetModel,
+    AutoencoderKL,
+
 )
 from diffusers.models.attention import BasicTransformerBlock
 from diffusers.models.cross_attention import LoRACrossAttnProcessor
-
+from controlnet_aux import HEDdetector
+from diffusers.utils import randn_tensor
+from diffusers.image_processor import VaeImageProcessor
+def _calc_inference_size(W, H, AI_INFERENCE_SIDE=512):
+    min_side = min(H, W)
+    max_side = max(H, W)
+    # MIN_SIDE should not be larger than INFERENCE_SIDE
+    min_divider = min_side / AI_INFERENCE_SIDE
+    if max_side // min_divider > AI_INFERENCE_SIDE * 2:
+        divider = max_side / (AI_INFERENCE_SIDE * 2)
+    else:
+        divider = min_divider
+    h = H
+    w = W
+    print("original_size", (w, h))
+    r_h = int(h // divider)
+    r_w = int(w // divider)
+    W, H = map(lambda x: x - x % 32, (r_w, r_h))
+    H = H
+    W = W
+    return (W, H), (w, h)
 
 def apply_unet_lora_weights(pipeline, unet_path):
     model_weight = torch.load(unet_path, map_location="cpu")
@@ -123,7 +146,8 @@ class AttentionBasedGenerator(nn.Module):
         model_ckpt: Optional[str] = None,
         stable_diffusion_version: str = "1.5",
         lora_weights: Optional[str] = None,
-        torch_dtype=torch.float32
+        torch_dtype=torch.float32,
+        cache_dir: Optional[str] = None,
     ):
         super().__init__()
 
@@ -142,20 +166,37 @@ class AttentionBasedGenerator(nn.Module):
 
         scheduler = EulerAncestralDiscreteScheduler.from_pretrained(model_name, subfolder="scheduler")
 
+        sd_vae_ft_mse = AutoencoderKL.from_pretrained('stabilityai/sd-vae-ft-mse', torch_dtype=torch.float16)
+
+        control_modelname = "lllyasviel/control_v11p_sd15_softedge"
+
+        controlnet = ControlNetModel.from_pretrained(
+            control_modelname, 
+            torch_dtype=torch.float16, 
+            use_safetensors=True,
+            cache_dir=cache_dir
+        )
+
         if model_ckpt is not None:
-            pipe = StableDiffusionPipeline.from_ckpt(
+            pipe = StableDiffusionControlNetPipeline.from_ckpt(
                 model_ckpt,
                 scheduler=scheduler,
+                vae=sd_vae_ft_mse,
+                controlnet=controlnet,
                 torch_dtype=torch_dtype,
                 safety_checker=None,
+                cache_dir=cache_dir,
             )
             pipe.scheduler = scheduler
         else:
-            pipe = StableDiffusionPipeline.from_pretrained(
+            pipe = StableDiffusionControlNetPipeline.from_pretrained(
                 model_name,
                 scheduler=scheduler,
+                vae=sd_vae_ft_mse,
+                controlnet=controlnet,
                 torch_dtype=torch_dtype,
                 safety_checker=None,
+                cache_dir=cache_dir,
             )
 
         if lora_weights:
@@ -167,10 +208,18 @@ class AttentionBasedGenerator(nn.Module):
         self.pipeline = pipe
         self.unet = pipe.unet
         self.vae = pipe.vae
+        self.hed = HEDdetector.from_pretrained("lllyasviel/Annotators")
         self.text_encoder = pipe.text_encoder
         self.tokenizer = pipe.tokenizer
+        self.controlnet = controlnet
         self.scheduler = scheduler
         self.dtype = torch_dtype
+
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True)
+        self.control_image_processor = VaeImageProcessor(
+            vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True, do_normalize=False
+        )
 
     @property
     def device(self):
@@ -203,7 +252,53 @@ class AttentionBasedGenerator(nn.Module):
         ).last_hidden_state
 
         return prompt_embd
+    
+    # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_latents
+    def prepare_latents(self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
+        shape = (batch_size, num_channels_latents, height // self.vae_scale_factor , width // self.vae_scale_factor )
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(
+                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+            )
 
+        if latents is None:
+            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        else:
+            latents = latents.to(device)
+
+        # scale the initial noise by the standard deviation required by the scheduler
+        latents = latents * self.scheduler.init_noise_sigma
+        return latents
+    def prepare_image(
+        self,
+        image,
+        width,
+        height,
+        batch_size,
+        num_images_per_prompt,
+        device,
+        dtype,
+        do_classifier_free_guidance=False,
+        guess_mode=False,
+    ):
+        image = self.control_image_processor.preprocess(image, height=height, width=width).to(dtype=torch.float32)
+        image_batch_size = image.shape[0]
+
+        if image_batch_size == 1:
+            repeat_by = batch_size
+        else:
+            # image batch size is the same as prompt batch size
+            repeat_by = num_images_per_prompt
+
+        image = image.repeat_interleave(repeat_by, dim=0)
+
+        image = image.to(device=device, dtype=dtype)
+
+        if do_classifier_free_guidance and not guess_mode:
+            image = torch.cat([image] * 2)
+
+        return image
     def get_unet_hidden_states(self, z_all, t, prompt_embd):
         cached_hidden_states = []
         for module in self.unet.modules():
@@ -232,13 +327,21 @@ class AttentionBasedGenerator(nn.Module):
         z_all,
         t,
         prompt_embd,
+        down_block_res_samples=None,
+        mid_block_res_sample=None,
         cached_pos_hiddens: Optional[List[torch.Tensor]] = None,
         cached_neg_hiddens: Optional[List[torch.Tensor]] = None,
         pos_weights=(0.8, 0.8),
         neg_weights=(0.5, 0.5),
     ):
         if cached_pos_hiddens is None and cached_neg_hiddens is None:
-            return self.unet(z_all, t, encoder_hidden_states=prompt_embd)
+            return self.unet(
+                z_all, 
+                t, 
+                encoder_hidden_states=prompt_embd,
+                down_block_additional_residuals=down_block_res_samples,
+                mid_block_additional_residual=mid_block_res_sample
+                )
 
         local_pos_weights = torch.linspace(
             *pos_weights, steps=len(self.unet.down_blocks) + 1
@@ -316,7 +419,13 @@ class AttentionBasedGenerator(nn.Module):
                     module.attn1.old_forward = module.attn1.forward
                     module.attn1.forward = new_forward.__get__(module.attn1)
 
-        out = self.unet(z_all, t, encoder_hidden_states=prompt_embd)
+        out = self.unet(
+                z_all, 
+                t, 
+                encoder_hidden_states=prompt_embd,
+                down_block_additional_residuals=down_block_res_samples,
+                mid_block_additional_residual=mid_block_res_sample
+            )
 
         # restore original forward pass
         for module in self.unet.modules():
@@ -329,10 +438,14 @@ class AttentionBasedGenerator(nn.Module):
     @torch.no_grad()
     def generate(
         self,
+        image: Image.Image,
         prompt: Union[str, List[str]] = "a photo of an astronaut riding a horse on mars",
         negative_prompt: Union[str, List[str]] = "",
         liked: List[Image.Image] = [],
         disliked: List[Image.Image] = [],
+        control_guidance_start: float = 0.0,
+        control_guidance_end: float = 1.0,
+        controlnet_conditioning_scale: float = 1.0,
         seed: int = 42,
         n_images: int = 1,
         guidance_scale: float = 8.0,
@@ -352,7 +465,36 @@ class AttentionBasedGenerator(nn.Module):
         if seed is not None:
             torch.manual_seed(seed)
 
-        z = torch.randn(n_images, 4, 64, 64, device=self.device, dtype=self.dtype)
+
+        resize_to = _calc_inference_size(image.size[0], image.size[1])[0]
+        image = image.convert("RGB")
+        original_size = image.size
+        image = image.resize(resize_to)
+
+        control_image = self.hed(image)
+        control_image = self.prepare_image(
+            image=image,
+            width=control_image.width,
+            height=control_image.height,
+            batch_size=1,
+            num_images_per_prompt=1,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        height, width = control_image.shape[-2:]
+
+        num_channels_latents = self.unet.config.in_channels
+
+        z = self.prepare_latents(
+            1,
+            num_channels_latents,
+            height,
+            width,
+            self.dtype,
+            self.device,
+            None,
+            None,
+        )
 
         if liked and len(liked) > 0:
             pos_images = [self.image_to_tensor(img) for img in liked]
@@ -395,6 +537,14 @@ class AttentionBasedGenerator(nn.Module):
 
         z = z * self.scheduler.init_noise_sigma
 
+
+        # Create tensor stating which controlnets to keep
+        controlnet_keep = []
+        for i in range(len(timesteps)):
+            keeps = 1.0 - float(i / len(timesteps) < control_guidance_start or (i + 1) / len(timesteps) > control_guidance_end)
+            controlnet_keep.append(keeps)
+
+
         num_warmup_steps = len(timesteps) - denoising_steps * self.scheduler.order
 
         ref_start_idx = round(len(timesteps) * feedback_start)
@@ -411,6 +561,20 @@ class AttentionBasedGenerator(nn.Module):
                 alpha_hat = 1 / (sigma**2 + 1)
 
                 z_single = self.scheduler.scale_model_input(z, t)
+
+                control_model_input = z_single
+                controlnet_prompt_embeds = batched_prompt_embd
+                cond_scale = controlnet_conditioning_scale * controlnet_keep[i]
+
+                down_block_res_samples, mid_block_res_sample = self.controlnet(
+                    control_model_input,
+                    t,
+                    encoder_hidden_states=controlnet_prompt_embeds,
+                    controlnet_cond=control_image,
+                    conditioning_scale=cond_scale,
+                    return_dict=False,
+                )
+
                 z_all = torch.cat([z_single] * 2, dim=0)
                 z_ref = torch.cat([pos_latents, neg_latents], dim=0)
 
@@ -460,6 +624,8 @@ class AttentionBasedGenerator(nn.Module):
                     z_all,
                     t,
                     prompt_embd=batched_prompt_embd,
+                    down_block_res_samples=down_block_res_samples,
+                    mid_block_res_sample=mid_block_res_sample,
                     cached_pos_hiddens=cached_pos_hs,
                     cached_neg_hiddens=cached_neg_hs,
                     pos_weights=pos_ws,
@@ -479,7 +645,11 @@ class AttentionBasedGenerator(nn.Module):
         y = self.pipeline.decode_latents(z)
         imgs = self.pipeline.numpy_to_pil(y)
 
-        return imgs
+        res = []
+        for img in imgs:
+            img = img.resize(original_size)
+            res.append(img)
+        return res
 
     @staticmethod
     def image_to_tensor(image: Union[str, Image.Image]):

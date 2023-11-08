@@ -19,3 +19,6 @@ resources/hps_lora/*
 
 # scripts 
 run_preference_model.sh
+
+
+cache
